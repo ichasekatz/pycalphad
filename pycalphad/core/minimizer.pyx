@@ -49,6 +49,124 @@ cpdef void lstsq_check_infeasible(double[:,::] A, double[::] b, double[::] out_x
         # lstsq solution is spurious; throw it away
         out_x[:] = np.nan
 
+
+@cython.boundscheck(False)
+cdef void lstsq_multi_rhs(double *A, int M, int N, double* B, int NRHS, double rcond) nogil:
+    """Solve min ||A @ X - B||_F for X with NRHS right-hand-side columns.
+
+    Parameters
+    ----------
+    A : double *
+        M×N matrix (column-major, LDA=N as in existing ``lstsq``).  Destroyed on exit.
+    M, N : int
+        Rows and columns of A.
+    B : double *
+        M×NRHS right-hand-side matrix (column-major, LDB=M).  On exit the first
+        N rows of each column hold the corresponding solution column.  Destroyed.
+    NRHS : int
+        Number of right-hand-side columns.
+    rcond : double
+        Singular-value threshold passed to dgelsd.
+    """
+    cdef int i
+    cdef int iwork = 0
+    cdef int info = 0
+    cdef int SMLSIZ = 50
+    cdef int NLVL = 10
+    cdef int lwork = 12*N + 2*N*SMLSIZ + 8*N*NLVL + N*NRHS + (SMLSIZ+1)**2
+    cdef int rank = 0
+    cdef double* work = <double*>malloc(lwork * sizeof(double))
+    cdef double* singular_values = <double*>malloc(N * sizeof(double))
+    cdef bint any_nan = False
+
+    for i in range(M * N):
+        if isnan(A[i]):
+            any_nan = True
+            break
+
+    if any_nan:
+        for i in range(M * NRHS):
+            B[i] = 0.0
+    else:
+        cython_lapack.dgelsd(&M, &N, &NRHS, A, &N, B, &M, singular_values, &rcond, &rank,
+                            work, &lwork, &iwork, &info)
+    free(singular_values)
+    free(work)
+    if info != 0:
+        for i in range(N * NRHS):
+            B[i] = -1e19
+
+
+cpdef np.ndarray lstsq_check_infeasible_multi(double[:, :] A, double[:, :] B):
+    """Batched least-squares solve:  min ||A @ X - B||_F for X (NRHS columns).
+
+    Parameters
+    ----------
+    A : (M, N) array.  Destroyed internally; a copy is taken.
+    B : (M, NRHS) array of right-hand-side columns.
+
+    Returns
+    -------
+    X : (M, NRHS) ndarray where X[:N, k] is the solution for column k.
+        Columns with residual > 1e-6 are set to NaN.
+    """
+    cdef int M = A.shape[0]
+    cdef int N = A.shape[1]
+    cdef int NRHS = B.shape[1]
+    cdef int k
+    cdef np.ndarray[np.float64_t, ndim=2, mode='c'] A_np
+    cdef np.ndarray[np.float64_t, ndim=2, mode='c'] X_np
+
+    A_np = np.array(A, order='C', dtype=np.float64)
+    X_np = np.array(B, order='C', dtype=np.float64)   # B copied; solutions overwrite first N rows
+
+    lstsq_multi_rhs(&A_np[0, 0], M, N, &X_np[0, 0], NRHS, 1e-16)
+
+    # Feasibility check per column
+    A_ref = np.asarray(A)
+    for k in range(NRHS):
+        residual = float(np.sum(np.square(A_ref @ np.asarray(X_np)[:N, k] - np.asarray(B)[:, k])))
+        if residual > 1e-6:
+            X_np[:, k] = np.nan
+    return np.asarray(X_np)
+
+
+cpdef object compute_jansson_sensitivities(SystemSpecification spec, SystemState state,
+                                           double[:, :] rhs_matrix):
+    """Batched Jansson sensitivity solve: J X = B with NRHS right-hand-side columns.
+
+    This function reuses a single equilibrium matrix factorization to compute
+    multiple sensitivity vectors simultaneously.  The caller is responsible for
+    assembling the right-hand-side columns in ``rhs_matrix`` according to the
+    physical perturbation of interest (e.g., a different model parameter for each
+    column).  The equilibrium system matrix J is the same for all columns.
+
+    Parameters
+    ----------
+    spec : SystemSpecification
+        Current system specification (fixed/free state variables unchanged).
+    state : SystemState
+        Converged equilibrium state.
+    rhs_matrix : (system_size, NRHS) C-contiguous float64 array
+        Each column is a right-hand-side vector for one sensitivity request.
+        The expected ordering within each column matches the structure of
+        ``construct_equilibrium_system`` output:
+        [mu_indices | phase_amount_indices | statevar_indices | extra_row].
+
+    Returns
+    -------
+    soln_matrix : (system_size, NRHS) ndarray
+        Column k holds the sensitivity solution for the k-th RHS column.
+        NaN entries indicate an infeasible (high-residual) solution.
+    """
+    cdef int system_size = rhs_matrix.shape[0]
+    cdef int NRHS = rhs_matrix.shape[1]
+
+    equilibrium_matrix, _ = construct_equilibrium_system(spec, state, 0)
+
+    soln = lstsq_check_infeasible_multi(equilibrium_matrix, rhs_matrix)
+    return np.asarray(soln)
+
 @cython.boundscheck(False)
 cdef void invert_matrix(double *A, int N, int* ipiv) nogil:
     "A will be overwritten."
@@ -1072,33 +1190,68 @@ cpdef state_variable_second_differential_TT(SystemSpecification spec, SystemStat
                 x_minus,
             )
     
-            known_vec = np.zeros(num_phase_dof, dtype=np.float64)
-    
+            # ------------------------------------------------------------------
+            # Analytical d_hess_y_a via compiled third-order tensor.
+            #
+            # The quantity d_hess_y_a = ∂G_{y_i, a}/∂s is the directional
+            # derivative of the Hessian entry (y_i, a) along the first-order
+            # equilibrium tangent.  Using the third-order tensor G_{ijk}:
+            #
+            #     d_hess_y_a = Σ_k G_{y_i, a, k} * (dx_k/ds)
+            #
+            # where (dx_k/ds) = delta_statevars[k]  for k < num_statevars
+            #                  = delta_sitefracs[idx][k - num_statevars]  otherwise.
+            #
+            # FD is retained for d_mass_jac_y and d_phase_matrix_y because
+            # their analytical equivalents (formulamole_hess, KKT second
+            # derivatives) are not yet exposed by PhaseRecord.
+            # ------------------------------------------------------------------
+            _total_dof = num_statevars + num_phase_dof
+            _third_tensor = np.zeros((_total_dof, _total_dof, _total_dof),
+                                     dtype=np.float64)
+            compset.phase_record.formulathird(_third_tensor, x0)
+
+            # Equilibrium DOF tangent vector
+            _delta_dof = np.zeros(_total_dof, dtype=np.float64)
+            for _k in range(num_statevars):
+                _delta_dof[_k] = delta_statevars[_k]
+            for _k in range(num_phase_dof):
+                _delta_dof[num_statevars + _k] = delta_sitefracs[idx][_k]
+
+            # Contract to obtain analytical d_hess_y_a for each y_i
+            _d_hess_ya_analytical = np.zeros(num_phase_dof, dtype=np.float64)
             for i in range(num_phase_dof):
-                d_hess_y_a = (
-                    hess_plus[num_statevars + i, target_statevar_index]
-                    - hess_minus[num_statevars + i, target_statevar_index]
-                ) / (2.0 * eps)
-    
-                known_vec[i] += d_hess_y_a
-    
+                for _k in range(_total_dof):
+                    _d_hess_ya_analytical[i] += (
+                        _third_tensor[num_statevars + i, target_statevar_index, _k]
+                        * _delta_dof[_k]
+                    )
+
+            known_vec = np.zeros(num_phase_dof, dtype=np.float64)
+
+            for i in range(num_phase_dof):
+                # Term 1: analytical via formulathird (replaces FD of hess_plus/minus)
+                known_vec[i] += _d_hess_ya_analytical[i]
+
+                # Term 2: d(mass_jac)/ds — FD retained (formulamole_hess unavailable)
                 for comp_idx in range(num_components):
                     d_mass_jac_y = (
                         mass_jac_plus[comp_idx, num_statevars + i]
                         - mass_jac_minus[comp_idx, num_statevars + i]
                     ) / (2.0 * eps)
-    
+
                     known_vec[i] -= (
                         d_mass_jac_y
                         * delta_chemical_potentials[comp_idx]
                     )
-    
+
+                # Term 3: d(phase_matrix)/ds — FD retained (KKT second derivatives unavailable)
                 for j in range(num_phase_dof):
                     d_phase_matrix_y = (
                         phase_matrix_plus[i, j]
                         - phase_matrix_minus[i, j]
                     ) / (2.0 * eps)
-    
+
                     known_vec[i] += (
                         d_phase_matrix_y
                         * delta_sitefracs[idx][j]
