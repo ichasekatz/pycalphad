@@ -359,12 +359,7 @@ class StateVariable(Symbol):
                                    delta_parameters=None)
 
     def jansson_second_deltas_TT(self, spec, state) -> JanssonSecondDerivativeDeltas:
-        """
-        Temporary second-order Jansson deltas for d²/dT² or d²/dP².
-
-        This currently calls a minimizer.pyx stub that returns zeros.
-        Later, minimizer.pyx will compute the real Eq. 8.17 RHS.
-        """
+        "Compute second-order Jansson deltas d²/da² for same-denominator state variable a"
         state_variables = state.compsets[0].phase_record.state_variables
         statevar_idx = sorted(state_variables, key=str).index(self)
 
@@ -950,17 +945,28 @@ class SystemMolesType(StateVariable):
         return self.__class__, ()
 
 def second_jansson_derivative_TT(numerator, denom, spec, state):
-    """
-    Temporary second-order Jansson dispatcher.
+    """Compute d²(numerator)/d(denom)² using second-order Jansson sensitivity.
 
-    Computes:
+    Parameters
+    ----------
+    numerator : ComputableProperty
+        Property to differentiate (NP, MU, or Y).
+    denom : StateVariable
+        State variable denominator (T or P).
+    spec : SystemSpecification
+        Equilibrium system specification.
+    state : SystemState
+        Current equilibrium state.
 
-        d²(numerator) / d(denom)²
+    Returns
+    -------
+    float or numpy.ndarray
+        Second derivative of numerator with respect to denom squared.
 
-    First supported numerators:
-        NP  -> phase amount / phase fraction
-        MU  -> chemical potential
-        Y   -> site fraction
+    Raises
+    ------
+    NotImplementedError
+        If numerator type is not yet supported.
     """
 
     second_deltas = denom.jansson_second_deltas_TT(spec, state)

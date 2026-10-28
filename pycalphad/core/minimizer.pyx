@@ -797,26 +797,9 @@ cpdef state_variable_differential(SystemSpecification spec, SystemState state, i
         spec.free_statevar_indices = orig_free_statevar_indices
 
 cpdef state_variable_second_differential_TT(SystemSpecification spec, SystemState state, int target_statevar_index):
-    """
-    First real second-order Jansson derivative implementation.
-
-    Computes:
-        d²(equilibrium state) / d(a)²
-
-    where a is a state variable, usually T.
-
-    This version is intended for:
-        d²/dT²
-
-    It reuses pycalphad's existing equilibrium matrix and fills a
-    second-order RHS using the single-potential Jansson equations.
-
-    Limitations of this first version:
-        - same-denominator state variable only: T,T or P,P
-        - third derivatives G_yTT are approximated by finite-differencing
-          the phase Hessian with respect to the target state variable
-        - validates best first against NP, MU, and Y, not HM.T.T yet
-    """
+    # Second-order Jansson: d²(equilibrium state)/d(a)², same-denominator state variable (T,T or P,P).
+    # G_yTT third derivatives approximated by finite-differencing the phase Hessian.
+    # Validates against NP, MU, Y; HM.T.T not yet covered.
 
     cdef double[::1,:] equilibrium_matrix
     cdef double[::1] equilibrium_soln
