@@ -7,9 +7,9 @@ from typing import Optional
 from symengine import Float, Symbol
 from pycalphad.core.cache import lru_cache
 from pycalphad.io.grammar import parse_chemical_formula
-from pycalphad.property_framework.types import JanssonDerivativeDeltas
+from pycalphad.property_framework.types import JanssonDerivativeDeltas, JanssonSecondDerivativeDeltas
 from pycalphad.core.minimizer import site_fraction_differential, state_variable_differential, \
-    fixed_component_differential, chemical_potential_differential
+    fixed_component_differential, chemical_potential_differential, state_variable_second_differential_TT
 import numpy as np
 from copy import copy
 
@@ -357,6 +357,27 @@ class StateVariable(Symbol):
         return JanssonDerivativeDeltas(delta_chemical_potentials=delta_chemical_potentials, delta_statevars=delta_statevars,
                                    delta_phase_amounts=delta_phase_amounts, delta_sitefracs=compsets_delta_sitefracs,
                                    delta_parameters=None)
+
+    def jansson_second_deltas_TT(self, spec, state) -> JanssonSecondDerivativeDeltas:
+        """
+        Temporary second-order Jansson deltas for d²/dT² or d²/dP².
+
+        This currently calls a minimizer.pyx stub that returns zeros.
+        Later, minimizer.pyx will compute the real Eq. 8.17 RHS.
+        """
+        state_variables = state.compsets[0].phase_record.state_variables
+        statevar_idx = sorted(state_variables, key=str).index(self)
+
+        delta2_chemical_potentials, delta2_statevars, delta2_phase_amounts, delta2_sitefracs = \
+            state_variable_second_differential_TT(spec, state, statevar_idx)
+
+        return JanssonSecondDerivativeDeltas(
+            delta2_chemical_potentials=delta2_chemical_potentials,
+            delta2_statevars=delta2_statevars,
+            delta2_parameters=None,
+            delta2_phase_amounts=delta2_phase_amounts,
+            delta2_sitefracs=delta2_sitefracs,
+        )
 
     def __reduce__(self):
         return self.__class__, (self.name,)
@@ -927,6 +948,57 @@ class SystemMolesType(StateVariable):
         super().__init__('N')
     def __reduce__(self):
         return self.__class__, ()
+
+def second_jansson_derivative_TT(numerator, denom, spec, state):
+    """
+    Temporary second-order Jansson dispatcher.
+
+    Computes:
+
+        d²(numerator) / d(denom)²
+
+    First supported numerators:
+        NP  -> phase amount / phase fraction
+        MU  -> chemical potential
+        Y   -> site fraction
+    """
+
+    second_deltas = denom.jansson_second_deltas_TT(spec, state)
+
+    if isinstance(numerator, PhaseFraction):
+        result = np.nan
+
+        for idx, compset in numerator.filtered(state.compsets):
+            if np.isnan(result):
+                result = 0.0
+            result += second_deltas.delta2_phase_amounts[idx]
+
+        return result
+
+    if isinstance(numerator, ChemicalPotential):
+        if len(state.compsets) == 0:
+            return np.nan
+
+        phase_record = state.compsets[0].phase_record
+        result = np.zeros(numerator.shape)
+
+        for element, multiplicity in numerator.species.constituents.items():
+            el_idx = phase_record.nonvacant_elements.index(element)
+            result += multiplicity * second_deltas.delta2_chemical_potentials[el_idx]
+
+        return result
+
+    if isinstance(numerator, SiteFraction):
+        for cs_idx, compset in numerator.filtered(state.compsets):
+            site_fractions = compset.phase_record.variables
+            sitefrac_idx = site_fractions.index(numerator._self_without_suffix)
+            return second_deltas.delta2_sitefracs[cs_idx][sitefrac_idx]
+
+        return np.nan
+
+    raise NotImplementedError(
+        f"Second-order Jansson derivative not implemented for {type(numerator)}"
+    )
 
 temperature = T = TemperatureType()
 pressure = P = PressureType()

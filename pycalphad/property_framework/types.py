@@ -16,6 +16,16 @@ class JanssonDerivativeDeltas:
     delta_phase_amounts: Optional[Any]
     delta_sitefracs: Optional[Any]
 
+@dataclass
+class JanssonSecondDerivativeDeltas:
+    delta2_chemical_potentials: Optional[Any]
+    delta2_statevars: Optional[Any]
+    delta2_parameters: Optional[Any]
+    delta2_phase_amounts: Optional[Any]
+    delta2_sitefracs: Optional[Any]
+    first_left: Optional[Any] = None
+    first_right: Optional[Any] = None
+
 @runtime_checkable
 class ComputableProperty(Protocol):
     implementation_units: UnitLike
