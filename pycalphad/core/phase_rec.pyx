@@ -83,6 +83,21 @@ cdef class FastFunctionFactory:
             it = self._cache_property_map.find(cache_key)
         return <void*>self._cache_ptr[deref(it).second]
 
+    cdef void* get_third(self, string property_name) except * nogil:
+        # Returns compiled callable for the full third-derivative tensor (n³ outputs, C order).
+        cdef pair[string, string] cache_key = pair[string, string](string(<char*>'third'), property_name)
+        cdef map[pair[string, string], int].iterator it
+        it = self._cache_property_map.find(cache_key)
+        if it == self._cache_property_map.end():
+            with gil:
+                self._cache_cur_idx += 1
+                if self._cache_cur_idx > self._cache.shape[0]:
+                    raise ValueError('Cache error')
+                self._cache[self._cache_cur_idx] = FastFunction(self.phase_record_factory.get_phase_property(self.phase_name, (<bytes>property_name).decode('utf-8'), include_grad=False, include_hess=False, include_third=True).third)
+                self._cache_property_map[cache_key] = self._cache_cur_idx
+            it = self._cache_property_map.find(cache_key)
+        return <void*>self._cache_ptr[deref(it).second]
+
     cpdef FastFunction get_cons_func(self):
         return FastFunction(self.phase_record_factory.get_phase_constraints(self.phase_name).internal_cons_func)
 
@@ -298,6 +313,24 @@ cdef public class PhaseRecord(object)[type PhaseRecordType, object PhaseRecordOb
         if self.parameters.shape[0] > 0:
             free(dof_concat)
 
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    cpdef void formulathird(self, double[:, :, ::1] out, double[::1] dof) nogil:
+        """Evaluate full third-derivative tensor of G.
+
+        Parameters
+        ----------
+        out : double[:, :, ::1]
+            Output array of shape (n, n, n) where n = num_statevars + phase_dof.
+            Entry [i, j, k] = d³G / d(dof[i]) d(dof[j]) d(dof[k]).
+        dof : double[::1]
+            Degrees of freedom vector (state variables then site fractions).
+        """
+        # dof.shape[0] may be oversized by the caller; do not trust it
+        cdef double* dof_concat = alloc_dof_with_parameters(dof[:self.num_statevars+self.phase_dof], self.parameters)
+        (<FastFunction>self.function_factory.get_third(<char*>'G')).call(&out[0,0,0], &dof_concat[0])
+        if self.parameters.shape[0] > 0:
+            free(dof_concat)
 
     @cython.boundscheck(False)
     @cython.wraparound(False)

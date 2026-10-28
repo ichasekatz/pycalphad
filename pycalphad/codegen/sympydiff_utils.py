@@ -32,7 +32,7 @@ from pycalphad.core.utils import wrap_symbol
 from symengine import ComplexDouble, sympify, lambdify, I, zoo, oo, have_llvm
 from collections import namedtuple
 
-BuildFunctionsResult = namedtuple('BuildFunctionsResult', ['func', 'grad', 'hess'])
+BuildFunctionsResult = namedtuple('BuildFunctionsResult', ['func', 'grad', 'hess', 'third'], defaults=[None, None, None, None])
 ConstraintFunctions = namedtuple('ConstraintFunctions', ['cons_func', 'cons_jac', 'cons_hess'])
 
 if have_llvm:
@@ -55,8 +55,10 @@ def _get_lambidfy_options(user_options):
 @cacheit
 def build_functions(symengine_graph, variables, parameters=None, wrt=None,
                     include_obj=True, include_grad=False, include_hess=False,
-                    func_options=None, grad_options=None, hess_options=None):
-    r"""Build function, gradient, and Hessian callables of the symengine_graph.
+                    include_third=False,
+                    func_options=None, grad_options=None, hess_options=None,
+                    third_options=None):
+    r"""Build function, gradient, Hessian, and optional third-derivative callables.
 
     Parameters
     ----------
@@ -71,31 +73,36 @@ def build_functions(symengine_graph, variables, parameters=None, wrt=None,
         Free variables in the symengine_graph. These are typically external
         parameters that are controlled by the user.
     wrt : Optional[List[symengine.Symbol]]
-        Variables to differentiate *with respect to* for the gradient and
-        Hessian callables. If None, will fall back to ``variables``.
+        Variables to differentiate *with respect to*. If None, falls back to ``variables``.
     include_obj : Optional[bool]
-        Whether to build the symengine_graph callable,
-        :math:`f(x) : \mathbb{R}^{n} \\rightarrow \mathbb{R}`
+        Whether to build the function callable.
     include_grad : Optional[bool]
-        Whether to build the gradient callable,
-        :math:`\\pmb{g}(x) = \\nabla f(x) : \mathbb{R}^{n} \\rightarrow \mathbb{R}^{n}`
+        Whether to build the gradient callable.
     include_hess : Optional[bool]
-        Whether to build the Hessian callable,
-        :math:`\mathbb{H}(x) = \\nabla^2 f(x) : \mathbb{R}^{n} \\rightarrow \mathbb{R}^{n \\times n}`
+        Whether to build the Hessian callable.
+    include_third : Optional[bool]
+        Whether to build the third-derivative callable.  Output is the full
+        symmetric third-derivative tensor with ``len(wrt)³`` entries written
+        in C order: ``tensor[i, j, k] = d³f / d(wrt[i]) d(wrt[j]) d(wrt[k])``.
+        Compilation time grows as ``n³``; only request when needed.
     func_options : Optional[Dict[str, str]]
         Options to pass to ``lambdify`` when compiling the function.
     grad_options : Optional[Dict[str, str]]
         Options to pass to ``lambdify`` when compiling the gradient.
     hess_options : Optional[Dict[str, str]]
-        Options to pass to ``lambdify`` when compiling Hessian.
+        Options to pass to ``lambdify`` when compiling the Hessian.
+    third_options : Optional[Dict[str, str]]
+        Options to pass to ``lambdify`` when compiling the third-derivative tensor.
 
     Returns
     -------
     BuildFunctionsResult
+        Named tuple with fields ``func``, ``grad``, ``hess``, ``third``.
+        ``third`` is ``None`` unless ``include_third=True``.
 
     Notes
     -----
-    Default options for compiling the function, gradient and Hessian are defined by ``_get_lambdify_options``.
+    Default options are defined by ``_get_lambdify_options``.
 
     """
     if wrt is None:
@@ -106,7 +113,7 @@ def build_functions(symengine_graph, variables, parameters=None, wrt=None,
         parameters = [wrap_symbol(p) for p in parameters]
     variables = tuple(variables)
     parameters = tuple(parameters)
-    func, grad, hess = None, None, None
+    func, grad, hess, third = None, None, None, None
     # Replace complex infinity (zoo) with real infinity because SymEngine
     # cannot lambdify complex numbers. We also replace in the derivatives in
     # case some differentiation would produce a complex infinity. The
@@ -128,14 +135,23 @@ def build_functions(symengine_graph, variables, parameters=None, wrt=None,
     # We assume that differentiating does create new complex numbers.
     graph = graph.xreplace({x: x.xreplace({I: 0.0}) for x in graph.atoms(ComplexDouble)})
     func = lambdify(inp, [graph], **_get_lambidfy_options(func_options))
-    if include_grad or include_hess:
+    if include_grad or include_hess or include_third:
         grad_graphs = list(graph.diff(w).xreplace({zoo: oo}) for w in wrt)
         if include_grad:
             grad = lambdify(inp, grad_graphs, **_get_lambidfy_options(grad_options))
-        if include_hess:
+        if include_hess or include_third:
             hess_graphs = list(list(g.diff(w).xreplace({zoo: oo}) for w in wrt) for g in grad_graphs)
-            hess = lambdify(inp, hess_graphs, **_get_lambidfy_options(hess_options))
-    return BuildFunctionsResult(func=func, grad=grad, hess=hess)
+            if include_hess:
+                hess = lambdify(inp, hess_graphs, **_get_lambidfy_options(hess_options))
+            if include_third:
+                # Full third-derivative tensor: third[i,j,k] = d³f/d(wrt[i])d(wrt[j])d(wrt[k])
+                # Written in C order; n³ expressions compiled as one lambdify call.
+                third_graphs = list(
+                    list(list(h.diff(w).xreplace({zoo: oo}) for w in wrt) for h in row)
+                    for row in hess_graphs
+                )
+                third = lambdify(inp, third_graphs, **_get_lambidfy_options(third_options))
+    return BuildFunctionsResult(func=func, grad=grad, hess=hess, third=third)
 
 
 @cacheit

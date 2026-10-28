@@ -46,7 +46,7 @@ class PhaseRecordFactory(object):
                                parameters=self.param_symbols)
 
     @lru_cache()
-    def get_phase_property(self, phase_name, property_name, include_grad=True, include_hess=True):
+    def get_phase_property(self, phase_name, property_name, include_grad=True, include_hess=True, include_third=False):
         mod = self.models[phase_name]
         out = getattr(mod, property_name)
         if out is None:
@@ -56,7 +56,7 @@ class PhaseRecordFactory(object):
         undef_vals = repeat(0., len(undefs))
         out = out.xreplace(dict(zip(undefs, undef_vals)))
         build_output = build_functions(out, tuple(self.state_variables + mod.site_fractions), parameters=self.param_symbols,
-                                       include_grad=include_grad, include_hess=include_hess)
+                                       include_grad=include_grad, include_hess=include_hess, include_third=include_third)
         return build_output
 
     def get_phase_formula_energy(self, phase_name):

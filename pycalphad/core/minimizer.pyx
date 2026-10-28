@@ -856,241 +856,271 @@ cpdef state_variable_second_differential_TT(SystemSpecification spec, SystemStat
     cdef CompositionSet compset
 
     # ------------------------------------------------------------------
-    # 1. First-order Jansson deltas: dmu/da, dstatevars/da, dNP/da
-    # ------------------------------------------------------------------
-    delta_chemical_potentials, delta_statevars, delta_phase_amounts = \
-        state_variable_differential(spec, state, target_statevar_index)
-
-    delta_sitefracs = []
-    for idx in range(len(state.compsets)):
-        csst = state.cs_states[idx]
-        delta_sitefracs.append(
-            site_fraction_differential(csst, delta_chemical_potentials, delta_statevars)
-        )
-
-    # ------------------------------------------------------------------
-    # 2. Allocate second-order outputs
-    # ------------------------------------------------------------------
-    delta2_chemical_potentials = np.zeros(spec.num_components)
-    delta2_statevars = np.zeros(spec.num_statevars)
-    delta2_phase_amounts = np.zeros(len(state.compsets))
-
-    known_delta2_sitefracs = []
-    delta2_sitefracs = []
-
-    for idx in range(len(state.compsets)):
-        csst = state.cs_states[idx]
-        known_delta2_sitefracs.append(np.zeros(csst.delta_y.shape[0]))
-        delta2_sitefracs.append(np.zeros(csst.delta_y.shape[0]))
-
-    # ------------------------------------------------------------------
-    # 3. Approximate known part of d²Y/da².
+    # 1. First-order Jansson deltas: dmu/da, dstatevars/da, dNP/da.
     #
-    #    We differentiate the first-order local-equilibrium equation:
-    #
-    #        A y' + H_y,a - M_y^T mu' = 0
-    #
-    #    where:
-    #        A      = phase_matrix
-    #        y'     = first-order site-fraction derivative
-    #        H_y,a  = mixed Hessian term with the target state variable
-    #        M_y    = mass Jacobian wrt site fractions
-    #
-    #    The known second-order RHS is:
-    #
-    #        A' y' + d(H_y,a)/da - d(M_y^T)/da mu'
-    #
-    #    Then:
-    #
-    #        y''_known = -E * known_vec
-    #
-    #    The unknown chemical-potential part is added after solving:
-    #
-    #        y'' = y''_known + C_component * mu'' + C_statevars * statevar''
-    # ------------------------------------------------------------------
-    eps = 1e-3
-    current_a = state.dof[0][target_statevar_index]
-
-    if abs(current_a) > 1.0:
-        eps = 1e-6 * abs(current_a)
-
-    for idx in range(len(state.compsets)):
-        csst = state.cs_states[idx]
-        compset = state.compsets[idx]
-        num_phase_dof = csst.delta_y.shape[0]
-
-        x0 = np.array(state.dof[idx], dtype=np.float64)
-        x_plus = np.array(x0, dtype=np.float64)
-        x_minus = np.array(x0, dtype=np.float64)
-
-        # Move along the first-order equilibrium path.
-        for i in range(num_statevars):
-            x_plus[i] += eps * delta_statevars[i]
-            x_minus[i] -= eps * delta_statevars[i]
-
-        for i in range(num_phase_dof):
-            x_plus[num_statevars + i] += eps * delta_sitefracs[idx][i]
-            x_minus[num_statevars + i] -= eps * delta_sitefracs[idx][i]
-
-        mu_plus = np.array(state.chemical_potentials, dtype=np.float64)
-        mu_minus = np.array(state.chemical_potentials, dtype=np.float64)
-
-        for comp_idx in range(num_components):
-            mu_plus[comp_idx] += eps * delta_chemical_potentials[comp_idx]
-            mu_minus[comp_idx] -= eps * delta_chemical_potentials[comp_idx]
-
-        hess_plus = np.zeros(
-            (csst.hess.shape[0], csst.hess.shape[1]),
-            dtype=np.float64,
-        )
-        hess_minus = np.zeros(
-            (csst.hess.shape[0], csst.hess.shape[1]),
-            dtype=np.float64,
-        )
-
-        mass_jac_plus = np.zeros(
-            (csst.mass_jac.shape[0], csst.mass_jac.shape[1]),
-            dtype=np.float64,
-        )
-        mass_jac_minus = np.zeros(
-            (csst.mass_jac.shape[0], csst.mass_jac.shape[1]),
-            dtype=np.float64,
-        )
-
-        phase_matrix_plus = np.zeros(
-            (csst.phase_matrix.shape[0], csst.phase_matrix.shape[1]),
-            dtype=np.float64,
-        )
-        phase_matrix_minus = np.zeros(
-            (csst.phase_matrix.shape[0], csst.phase_matrix.shape[1]),
-            dtype=np.float64,
-        )
-
-        cons_jac_plus = np.zeros(
-            (csst.cons_jac_tmp.shape[0], csst.cons_jac_tmp.shape[1]),
-            dtype=np.float64,
-        )
-        cons_jac_minus = np.zeros(
-            (csst.cons_jac_tmp.shape[0], csst.cons_jac_tmp.shape[1]),
-            dtype=np.float64,
-        )
-
-        phase_local_jac_plus = np.zeros(
-            (csst.phase_local_jac_tmp.shape[0], csst.phase_local_jac_tmp.shape[1]),
-            dtype=np.float64,
-        )
-        phase_local_jac_minus = np.zeros(
-            (csst.phase_local_jac_tmp.shape[0], csst.phase_local_jac_tmp.shape[1]),
-            dtype=np.float64,
-        )
-
-        mass_hess_plus = np.zeros(
-            (csst.mass_hess_tmp.shape[0], csst.mass_hess_tmp.shape[1]),
-            dtype=np.float64,
-        )
-        mass_hess_minus = np.zeros(
-            (csst.mass_hess_tmp.shape[0], csst.mass_hess_tmp.shape[1]),
-            dtype=np.float64,
-        )
-
-        compset.phase_record.formulahess(hess_plus, x_plus)
-        compset.phase_record.formulahess(hess_minus, x_minus)
-
-        for comp_idx in range(num_components):
-            compset.phase_record.formulamole_grad(
-                mass_jac_plus[comp_idx, :],
-                x_plus,
-                comp_idx,
-            )
-            compset.phase_record.formulamole_grad(
-                mass_jac_minus[comp_idx, :],
-                x_minus,
-                comp_idx,
-            )
-
-        compute_phase_matrix(
-            phase_matrix_plus,
-            hess_plus,
-            cons_jac_plus,
-            phase_local_jac_plus,
-            mass_hess_plus,
-            compset,
-            num_statevars,
-            mu_plus,
-            x_plus,
-        )
-
-        compute_phase_matrix(
-            phase_matrix_minus,
-            hess_minus,
-            cons_jac_minus,
-            phase_local_jac_minus,
-            mass_hess_minus,
-            compset,
-            num_statevars,
-            mu_minus,
-            x_minus,
-        )
-
-        known_vec = np.zeros(num_phase_dof, dtype=np.float64)
-
-        for i in range(num_phase_dof):
-            d_hess_y_a = (
-                hess_plus[num_statevars + i, target_statevar_index]
-                - hess_minus[num_statevars + i, target_statevar_index]
-            ) / (2.0 * eps)
-
-            known_vec[i] += d_hess_y_a
-
-            for comp_idx in range(num_components):
-                d_mass_jac_y = (
-                    mass_jac_plus[comp_idx, num_statevars + i]
-                    - mass_jac_minus[comp_idx, num_statevars + i]
-                ) / (2.0 * eps)
-
-                known_vec[i] -= (
-                    d_mass_jac_y
-                    * delta_chemical_potentials[comp_idx]
-                )
-
-            for j in range(num_phase_dof):
-                d_phase_matrix_y = (
-                    phase_matrix_plus[i, j]
-                    - phase_matrix_minus[i, j]
-                ) / (2.0 * eps)
-
-                known_vec[i] += (
-                    d_phase_matrix_y
-                    * delta_sitefracs[idx][j]
-                )
-
-        for i in range(num_phase_dof):
-            known_delta2_sitefracs[idx][i] = 0.0
-            for j in range(num_phase_dof):
-                known_delta2_sitefracs[idx][i] -= (
-                    csst.full_e_matrix[i, j]
-                    * known_vec[j]
-                )
-
-    # ------------------------------------------------------------------
-    # 4. Temporarily free the target state variable, same as
-    #    state_variable_differential(...)
+    #    We inline state_variable_differential here so we can reuse the
+    #    equilibrium matrix for the second-order solve (section 4 below)
+    #    without rebuilding it a second time.
     # ------------------------------------------------------------------
     orig_fixed_statevar_indices = np.array(spec.fixed_statevar_indices)
     orig_free_statevar_indices = np.array(spec.free_statevar_indices)
 
     spec.fixed_statevar_indices = np.setdiff1d(
-        spec.fixed_statevar_indices,
-        np.array(target_statevar_index)
+        spec.fixed_statevar_indices, np.array(target_statevar_index)
     )
     spec.free_statevar_indices = np.append(
-        spec.free_statevar_indices,
-        target_statevar_index
+        spec.free_statevar_indices, target_statevar_index
     ).astype(np.int32)
 
+    delta_chemical_potentials = np.zeros(spec.num_components)
+    delta_statevars = np.zeros(spec.num_statevars)
+    delta_phase_amounts = np.zeros(len(state.compsets))
+
     try:
+        # Build equilibrium matrix ONCE; reuse for both first- and second-order solves.
         equilibrium_matrix, equilibrium_soln = construct_equilibrium_system(spec, state, 1)
-        equilibrium_soln[:] = 0.0
+        # Save a C-contiguous copy before lstsq_check_infeasible destroys the original.
+        equilibrium_matrix_saved = np.array(equilibrium_matrix, order='C')
+
+        equilibrium_soln[:] = 0
+        equilibrium_matrix[-1, -1] = 1
+        equilibrium_soln[-1] = 1
+        lstsq_check_infeasible(equilibrium_matrix, equilibrium_soln, equilibrium_soln)
+
+        for i in range(spec.free_chemical_potential_indices.shape[0]):
+            chempot_idx = spec.free_chemical_potential_indices[i]
+            delta_chemical_potentials[chempot_idx] = equilibrium_soln[i]
+        for i in range(state.free_stable_compset_indices.shape[0]):
+            cs_idx = state.free_stable_compset_indices[i]
+            delta_phase_amounts[cs_idx] = equilibrium_soln[spec.free_chemical_potential_indices.shape[0] + i]
+        for i in range(spec.free_statevar_indices.shape[0]):
+            statevar_idx = spec.free_statevar_indices[i]
+            delta_statevars[statevar_idx] = equilibrium_soln[
+                spec.free_chemical_potential_indices.shape[0]
+                + state.free_stable_compset_indices.shape[0]
+                + i
+            ]
+
+        delta_sitefracs = []
+        for idx in range(len(state.compsets)):
+            csst = state.cs_states[idx]
+            delta_sitefracs.append(
+                site_fraction_differential(csst, delta_chemical_potentials, delta_statevars)
+            )
+
+        # ------------------------------------------------------------------
+        # 2. Allocate second-order outputs
+        # ------------------------------------------------------------------
+        delta2_chemical_potentials = np.zeros(spec.num_components)
+        delta2_statevars = np.zeros(spec.num_statevars)
+        delta2_phase_amounts = np.zeros(len(state.compsets))
+
+        known_delta2_sitefracs = []
+        delta2_sitefracs = []
+
+        for idx in range(len(state.compsets)):
+            csst = state.cs_states[idx]
+            known_delta2_sitefracs.append(np.zeros(csst.delta_y.shape[0]))
+            delta2_sitefracs.append(np.zeros(csst.delta_y.shape[0]))
+
+        # ------------------------------------------------------------------
+        # 3. Approximate known part of d²Y/da².
+        #
+        #    We differentiate the first-order local-equilibrium equation:
+        #
+        #        A y' + H_y,a - M_y^T mu' = 0
+        #
+        #    where:
+        #        A      = phase_matrix
+        #        y'     = first-order site-fraction derivative
+        #        H_y,a  = mixed Hessian term with the target state variable
+        #        M_y    = mass Jacobian wrt site fractions
+        #
+        #    The known second-order RHS is:
+        #
+        #        A' y' + d(H_y,a)/da - d(M_y^T)/da mu'
+        #
+        #    Then:
+        #
+        #        y''_known = -E * known_vec
+        #
+        #    The unknown chemical-potential part is added after solving:
+        #
+        #        y'' = y''_known + C_component * mu'' + C_statevars * statevar''
+        # ------------------------------------------------------------------
+        eps = 1e-3
+        current_a = state.dof[0][target_statevar_index]
+
+        if abs(current_a) > 1.0:
+            eps = 1e-6 * abs(current_a)
+
+        for idx in range(len(state.compsets)):
+            csst = state.cs_states[idx]
+            compset = state.compsets[idx]
+            num_phase_dof = csst.delta_y.shape[0]
+    
+            x0 = np.array(state.dof[idx], dtype=np.float64)
+            x_plus = np.array(x0, dtype=np.float64)
+            x_minus = np.array(x0, dtype=np.float64)
+    
+            # Move along the first-order equilibrium path.
+            for i in range(num_statevars):
+                x_plus[i] += eps * delta_statevars[i]
+                x_minus[i] -= eps * delta_statevars[i]
+    
+            for i in range(num_phase_dof):
+                x_plus[num_statevars + i] += eps * delta_sitefracs[idx][i]
+                x_minus[num_statevars + i] -= eps * delta_sitefracs[idx][i]
+    
+            mu_plus = np.array(state.chemical_potentials, dtype=np.float64)
+            mu_minus = np.array(state.chemical_potentials, dtype=np.float64)
+    
+            for comp_idx in range(num_components):
+                mu_plus[comp_idx] += eps * delta_chemical_potentials[comp_idx]
+                mu_minus[comp_idx] -= eps * delta_chemical_potentials[comp_idx]
+    
+            hess_plus = np.zeros(
+                (csst.hess.shape[0], csst.hess.shape[1]),
+                dtype=np.float64,
+            )
+            hess_minus = np.zeros(
+                (csst.hess.shape[0], csst.hess.shape[1]),
+                dtype=np.float64,
+            )
+    
+            mass_jac_plus = np.zeros(
+                (csst.mass_jac.shape[0], csst.mass_jac.shape[1]),
+                dtype=np.float64,
+            )
+            mass_jac_minus = np.zeros(
+                (csst.mass_jac.shape[0], csst.mass_jac.shape[1]),
+                dtype=np.float64,
+            )
+    
+            phase_matrix_plus = np.zeros(
+                (csst.phase_matrix.shape[0], csst.phase_matrix.shape[1]),
+                dtype=np.float64,
+            )
+            phase_matrix_minus = np.zeros(
+                (csst.phase_matrix.shape[0], csst.phase_matrix.shape[1]),
+                dtype=np.float64,
+            )
+    
+            cons_jac_plus = np.zeros(
+                (csst.cons_jac_tmp.shape[0], csst.cons_jac_tmp.shape[1]),
+                dtype=np.float64,
+            )
+            cons_jac_minus = np.zeros(
+                (csst.cons_jac_tmp.shape[0], csst.cons_jac_tmp.shape[1]),
+                dtype=np.float64,
+            )
+    
+            phase_local_jac_plus = np.zeros(
+                (csst.phase_local_jac_tmp.shape[0], csst.phase_local_jac_tmp.shape[1]),
+                dtype=np.float64,
+            )
+            phase_local_jac_minus = np.zeros(
+                (csst.phase_local_jac_tmp.shape[0], csst.phase_local_jac_tmp.shape[1]),
+                dtype=np.float64,
+            )
+    
+            mass_hess_plus = np.zeros(
+                (csst.mass_hess_tmp.shape[0], csst.mass_hess_tmp.shape[1]),
+                dtype=np.float64,
+            )
+            mass_hess_minus = np.zeros(
+                (csst.mass_hess_tmp.shape[0], csst.mass_hess_tmp.shape[1]),
+                dtype=np.float64,
+            )
+    
+            compset.phase_record.formulahess(hess_plus, x_plus)
+            compset.phase_record.formulahess(hess_minus, x_minus)
+    
+            for comp_idx in range(num_components):
+                compset.phase_record.formulamole_grad(
+                    mass_jac_plus[comp_idx, :],
+                    x_plus,
+                    comp_idx,
+                )
+                compset.phase_record.formulamole_grad(
+                    mass_jac_minus[comp_idx, :],
+                    x_minus,
+                    comp_idx,
+                )
+    
+            compute_phase_matrix(
+                phase_matrix_plus,
+                hess_plus,
+                cons_jac_plus,
+                phase_local_jac_plus,
+                mass_hess_plus,
+                compset,
+                num_statevars,
+                mu_plus,
+                x_plus,
+            )
+    
+            compute_phase_matrix(
+                phase_matrix_minus,
+                hess_minus,
+                cons_jac_minus,
+                phase_local_jac_minus,
+                mass_hess_minus,
+                compset,
+                num_statevars,
+                mu_minus,
+                x_minus,
+            )
+    
+            known_vec = np.zeros(num_phase_dof, dtype=np.float64)
+    
+            for i in range(num_phase_dof):
+                d_hess_y_a = (
+                    hess_plus[num_statevars + i, target_statevar_index]
+                    - hess_minus[num_statevars + i, target_statevar_index]
+                ) / (2.0 * eps)
+    
+                known_vec[i] += d_hess_y_a
+    
+                for comp_idx in range(num_components):
+                    d_mass_jac_y = (
+                        mass_jac_plus[comp_idx, num_statevars + i]
+                        - mass_jac_minus[comp_idx, num_statevars + i]
+                    ) / (2.0 * eps)
+    
+                    known_vec[i] -= (
+                        d_mass_jac_y
+                        * delta_chemical_potentials[comp_idx]
+                    )
+    
+                for j in range(num_phase_dof):
+                    d_phase_matrix_y = (
+                        phase_matrix_plus[i, j]
+                        - phase_matrix_minus[i, j]
+                    ) / (2.0 * eps)
+    
+                    known_vec[i] += (
+                        d_phase_matrix_y
+                        * delta_sitefracs[idx][j]
+                    )
+    
+            for i in range(num_phase_dof):
+                known_delta2_sitefracs[idx][i] = 0.0
+                for j in range(num_phase_dof):
+                    known_delta2_sitefracs[idx][i] -= (
+                        csst.full_e_matrix[i, j]
+                        * known_vec[j]
+                    )
+
+        # ------------------------------------------------------------------
+        # 4. Reuse the saved equilibrium matrix for the second-order solve.
+        #
+        #    The statevar is already free (moved in section 1).  We restore
+        #    the matrix from equilibrium_matrix_saved because lstsq_check_infeasible
+        #    overwrote equilibrium_matrix in place during the first-order solve.
+        # ------------------------------------------------------------------
+        equilibrium_matrix = np.asfortranarray(equilibrium_matrix_saved)
+        equilibrium_soln = np.zeros(equilibrium_matrix.shape[0])
 
         # --------------------------------------------------------------
         # 5. Stable phase equilibrium rows.
